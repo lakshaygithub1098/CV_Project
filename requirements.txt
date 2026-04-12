@@ -1,0 +1,23 @@
+# TrafficManagerCV Requirements
+
+# Core Computer Vision
+opencv-python>=4.8.0            # Image processing and video I/O
+ultralytics>=8.0.0              # YOLOv8 object detection
+scipy>=1.10.0                   # Scientific computing (Hungarian algorithm)
+numpy>=1.24.0                   # Numerical computing
+
+# Data Processing
+pandas>=2.0.0                   # Data analysis and manipulation
+
+# Video Processing
+imageio-ffmpeg>=0.4.8           # FFmpeg wrapper for video processing
+
+# Development & Testing
+pytest>=7.0.0                   # Testing framework
+pytest-cov>=4.0.0               # Test coverage
+black>=23.0.0                   # Code formatting
+flake8>=6.0.0                   # Code linting
+
+# Optional GPU Support (uncomment if using CUDA)
+# torch>=2.0.0[cu118]           # PyTorch with CUDA 11.8
+# torchvision>=0.15.0           # PyTorch vision utilities

@@ -2,31 +2,15 @@ import math
 
 
 class SpeedEstimator:
-    """
-    Estimates per-vehicle speed by comparing each vehicle's centroid position
-    between consecutive frames.
-
-    Speed is expressed in pixels-per-frame.  To convert to real-world units
-    (e.g. km/h) you would multiply by a pixel-to-metre scale factor and the
-    camera's frame rate — that calibration step is left to the caller.
-    """
+    """Estimates per-vehicle speed from centroid displacement (pixels/frame)."""
 
     def __init__(self):
+        """Initialize position tracking dict."""
         # Maps track_id -> (cx, cy) from the previous frame.
         self.prev_positions = {}
 
     def estimate_speed(self, tracks):
-        """
-        Compute the pixel-per-frame speed for every tracked vehicle.
-
-        Args:
-            tracks (list): List of tracks from SORT.  Each element is a
-                           sequence: [x1, y1, x2, y2, track_id].
-
-        Returns:
-            dict: {track_id: speed} where speed is a float (pixels/frame).
-                  Vehicles seen for the first time in this call have speed 0.
-        """
+        """Compute pixel/frame speed for each vehicle; 0 for new vehicles."""
         speed_dict = {}
 
         for track in tracks:
@@ -52,16 +36,7 @@ class SpeedEstimator:
         return speed_dict
 
     def average_speed(self, speed_dict):
-        """
-        Compute the average speed across all currently tracked vehicles.
-
-        Args:
-            speed_dict (dict): Output of estimate_speed(), mapping
-                               track_id -> speed.
-
-        Returns:
-            float: Mean speed in pixels/frame, or 0 if no vehicles are tracked.
-        """
+        """Return mean speed across all vehicles, or 0 if empty."""
         if not speed_dict:
             return 0
 

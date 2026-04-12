@@ -1,220 +1,298 @@
+
 import cv2
 import glob
 import os
 import sys
 
-# ── Fix display issues on Linux / GNOME / Wayland ─────────────────────────────
-# OpenCV's Qt highgui must be told to use the X11/XCB backend.
-# On Wayland desktops (Ubuntu 22+, Fedora 36+, etc.) it otherwise either
-# fails to open a window or floods the terminal with font warnings.
+# Fix Wayland display issues on Linux
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 os.environ.setdefault("QT_FONT_DPI", "96")
 
-# Make sure Python can find the backend packages regardless of where the
-# script is launched from.
+# Allow imports from backend folder
 sys.path.insert(0, os.path.dirname(__file__))
 
-from detection.motion_detector  import MotionDetector
+from detection.yolo_detector    import YOLODetector
+from detection.hybrid_detector  import HybridDetector, HybridAnalyzer
+from evaluation.mog2_evaluator  import MOG2BackgroundSubtractor
 from tracking.sort_tracker      import SortTracker
-from analysis.lane_analyzer     import LaneAnalyzer
 from analysis.speed_estimator   import SpeedEstimator
+from analysis.road_analyzer     import RoadAnalyzer
 
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-# Directory (relative to project root) that contains the video files.
+# Settings
 VIDEOS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "videos")
-
-# Colour and thickness of the bounding-box rectangles (BGR format).
-BOX_COLOR     = (0, 255, 0)   # green
+BOX_COLOR = (0, 255, 0)  # green boxes
 BOX_THICKNESS = 2
+MAX_AGE = 5  # tracker keeps object for 5 frames
+MIN_HITS = 1  # show ID after 1 detection
+IOU_THRESHOLD = 0.3  # matching threshold
+FRAME_W = 1280
+ROI_X_MIN = 552  # tuned to right-hand carriageway left edge
+ROI_X_MAX = 1160  # tuned to right-hand carriageway right edge
+ROI_Y_TOP = 220   # lane perspective starts higher for this video
+ROI_Y_BOTTOM = 720
 
-# SORT tracker parameters.
-MAX_AGE       = 5
-MIN_HITS      = 1
-IOU_THRESHOLD = 0.3
+# Hybrid detection settings
+USE_HYBRID_DETECTION = True  # Enable YOLO + MOG2 hybrid mode
+USE_MOG2_DETECTION = True    # Enable separate MOG2 motion detection
+USE_MOTION_OVERLAY = False   # Show MOG2 motion mask overlay
 
-# ROI (Region of Interest) for lane analysis.
-# Frames are always resized to 1280×720, so these pixel values are constant.
-# Vehicles whose centroid falls between ROI_X_MIN and ROI_X_MAX are counted
-# for lane assignment, speed, and congestion.  Vehicles outside the ROI are
-# still detected and drawn but do not affect the traffic statistics.
-FRAME_W   = 1280
-ROI_X_MIN = int(FRAME_W * 0.45)   # 576  — left  edge of highway lanes
-ROI_X_MAX = int(FRAME_W * 0.95)   # 1216 — right edge of highway lanes
+DATASET_SAMPLE_VIDEO = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "data",
+    "archive(2)",
+    "Vehicle_Detection_Image_Dataset",
+    "sample_video.mp4",
+)
 
 
 # ── Per-video processing ──────────────────────────────────────────────────────
 
-def process_video(video_path, analyzer):
-    """
-    Open a single video file, run the full pipeline on every frame, and
-    display the results in two windows until the video ends or ESC is pressed.
+def _compute_iou(box1, box2):
+    """Compute Intersection over Union between two boxes [x1,y1,x2,y2]."""
+    x1_min, y1_min, x1_max, y1_max = box1
+    x2_min, y2_min, x2_max, y2_max = box2
+    
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
+    
+    if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+        return 0.0
+    
+    inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+    box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0.0
 
-    A fresh MotionDetector and SortTracker are created for each video so that
-    the MOG2 background model and track IDs always start clean.
+def compute_traffic_state(total, avg_speed):
+    """Simple temporary traffic state without lane analysis."""
+    if total < 6 and avg_speed > 10:
+        return "LIGHT"
+    elif total > 12 or avg_speed < 4:
+        return "HEAVY"
+    return "MEDIUM"
 
-    Args:
-        video_path (str): Absolute or relative path to the video file.
-        analyzer   (LaneAnalyzer): Pre-built lane analyser (shared across videos).
-
-    Returns:
-        bool: True if the video finished normally, False if ESC was pressed.
-    """
+def process_video(video_path, loop=True):
+    """Run full pipeline on a video with two-road analysis. Loop until Ctrl+C if loop=True."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[WARNING] Could not open video: {video_path} — skipping.")
         return True
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_delay = max(int(1000 / fps), 1) if fps and fps > 1 else 33
+
     print(f"\n[INFO] Processing: {os.path.basename(video_path)}")
-    print("[INFO] Press ESC to skip to the next video.")
+    print(f"[INFO] Hybrid Detection: {'ENABLED' if USE_HYBRID_DETECTION else 'DISABLED'}")
+    print("[INFO] Press Ctrl+C in the terminal to stop.")
+    if USE_MOTION_OVERLAY:
+        print("[INFO] Motion overlay: ENABLED (red = motion detected)")
 
-    # Create a fresh detector, tracker, and speed estimator for this video.
-    # Each video starts with a clean background model, track IDs, and
-    # position history so readings don't bleed between files.
-    detector  = MotionDetector()
-    tracker   = SortTracker(
-        max_age=MAX_AGE,
-        min_hits=MIN_HITS,
-        iou_threshold=IOU_THRESHOLD,
-    )
-    estimator = SpeedEstimator()
-
-    # Create (or re-use) the display windows.
+    # Create display windows
     cv2.namedWindow("Traffic Detection", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Traffic Detection", 1280, 720)
-    cv2.namedWindow("Foreground Mask",   cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Foreground Mask",   640, 360)
+
+    FRAME_HEIGHT = 720
+    FRAME_WIDTH = 1280
+
+    def reset_pipeline():
+        components = (
+            YOLODetector(),
+            SortTracker(max_age=MAX_AGE, min_hits=MIN_HITS, iou_threshold=IOU_THRESHOLD),
+            SpeedEstimator(),
+            RoadAnalyzer(frame_width=FRAME_WIDTH, frame_height=FRAME_HEIGHT),
+        )
+        
+        # Initialize hybrid detector if enabled
+        if USE_HYBRID_DETECTION:
+            mog2 = MOG2BackgroundSubtractor(history=500, var_threshold=16)
+            hybrid = HybridDetector(components[0], mog2)
+            return components + (hybrid, mog2)
+        
+        return components
+
+    pipeline = reset_pipeline()
+    detector = pipeline[0]
+    tracker = pipeline[1]
+    estimator = pipeline[2]
+    road_analyzer = pipeline[3]
+    hybrid_detector = pipeline[4] if len(pipeline) > 4 else None
+    mog2 = pipeline[5] if len(pipeline) > 5 else None
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            # End of video.
-            break
+            if loop:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                pipeline = reset_pipeline()
+                detector = pipeline[0]
+                tracker = pipeline[1]
+                estimator = pipeline[2]
+                road_analyzer = pipeline[3]
+                hybrid_detector = pipeline[4] if len(pipeline) > 4 else None
+                mog2 = pipeline[5] if len(pipeline) > 5 else None
+                continue
+            break  # End of video
 
-        # ── 1. Resize to 1280×720 for consistent processing ───────────────────
-        frame = cv2.resize(frame, (1280, 720))
+        # Step 1: Resize to 1280x720 for processing
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-        # ── 2. Detect moving vehicles ─────────────────────────────────────────
-        bounding_boxes, fg_mask = detector.detect(frame)
+        # Step 2: Detect vehicles with YOLOv8 or Hybrid (YOLO + MOG2)
+        hybrid_detections = []  # Store hybrid detections for drawing later
+        if USE_HYBRID_DETECTION and hybrid_detector:
+            # Use hybrid detector that validates with MOG2
+            hybrid_detections = hybrid_detector.detect(frame, use_motion_validation=True)
+            # Convert to original format: (x1, y1, x2, y2, confidence)
+            detections = [(x1, y1, x2, y2, conf) for x1, y1, x2, y2, conf, _ in hybrid_detections]
+            motion_validated_flags = {(int(x1), int(y1), int(x2), int(y2)): validated 
+                                     for x1, y1, x2, y2, _, validated in hybrid_detections}
+        else:
+            # Use original YOLO detector only
+            detections = detector.detect(frame)
+            motion_validated_flags = {}
 
-        # ── 3. Track vehicles across frames with SORT ─────────────────────────
-        # Append score=1.0 to each detection before passing to the tracker.
-        detections_for_tracker = [
-            [x1, y1, x2, y2, 1.0]
-            for (x1, y1, x2, y2) in bounding_boxes
-        ]
-        tracked_vehicles = tracker.update(detections_for_tracker)
+        # Build confidence map: vehicle_id -> confidence score
+        # Map detections to a dict of box -> confidence for later lookup
+        detection_confidences = {(int(d[0]), int(d[1]), int(d[2]), int(d[3])): d[4] for d in detections}
 
-        # ── 4. ROI filter — only vehicles on the main highway (45 %–95 % of frame) ─
-        # Detection and drawing use all tracked_vehicles.
-        # Lane counting, speed, and congestion use only lane_tracks so that
-        # vehicles on adjacent roads or at frame edges don't skew results.
-        roi_x_min = ROI_X_MIN
-        roi_x_max = ROI_X_MAX
-        lane_tracks = [
-            t for t in tracked_vehicles
-            if roi_x_min < int((t[0] + t[2]) / 2) < roi_x_max
-        ]
+        # Step 3: Track vehicles across frames
+        tracked_vehicles = tracker.update(detections)
 
-        # ── 5. Speed estimation (must run before congestion) ─────────────────
-        speeds    = estimator.estimate_speed(lane_tracks)
-        avg_speed = estimator.average_speed(speeds)
+        # Map tracked vehicle IDs to confidence scores
+        # Match tracked boxes to original detections to get confidence
+        confidence_map = {}
+        for tracked in tracked_vehicles:
+            x1, y1, x2, y2, vid = tracked
+            # Find closest matching detection
+            best_conf = 0.5  # default confidence
+            for det in detections:
+                dx1, dy1, dx2, dy2, conf = det
+                # Check if boxes overlap significantly
+                iou = _compute_iou([x1, y1, x2, y2], [dx1, dy1, dx2, dy2])
+                if iou > 0.3:  # Good match
+                    best_conf = conf
+                    break
+            confidence_map[vid] = best_conf
 
-        # ── 6. Lane analysis and congestion (ROI vehicles only) ───────────────
-        lane_counts = analyzer.count_vehicles_per_lane(lane_tracks)
-        congestion  = analyzer.compute_congestion(sum(lane_counts.values()), avg_speed)
+        # Step 4: Speed estimation for all tracked vehicles
+        speeds = estimator.estimate_speed(tracked_vehicles)
 
-        # ── 7. Draw ROI boundary lines ──────────────────────────────────────────
-        cv2.line(frame, (roi_x_min, 0), (roi_x_min, frame.shape[0]),
-                 (0, 255, 255), 2)
-        cv2.line(frame, (roi_x_max, 0), (roi_x_max, frame.shape[0]),
-                 (0, 255, 255), 2)
-        cv2.putText(frame, "Analysis Zone", (roi_x_min + 6, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+        # Step 5: Assign vehicles to roads and compute statistics
+        road_stats = road_analyzer.compute_road_statistics(tracked_vehicles, speeds)
 
-        # ── 8. Draw lane outlines (so boxes appear on top) ────────────────────
-        analyzer.draw_lanes(frame)
+        # Step 6: Draw road divider line and labels
+        frame = road_analyzer.draw_road_divider(frame, color=(0, 255, 255), thickness=2)
+        frame = road_analyzer.draw_road_labels(frame, font_scale=0.75, thickness=2)
 
-        # ── 9. Draw bounding boxes, IDs, and per-vehicle speed ────────────────
-        # Use all tracked_vehicles so detections outside the ROI are still shown.
-        for (x1, y1, x2, y2, vehicle_id) in tracked_vehicles:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICKNESS)
-            spd     = speeds.get(vehicle_id, 0)
-            label   = f"ID:{int(vehicle_id)}  {spd:.0f}px"
-            label_y = max(y1 - 5, 15)   # keep label inside frame
-            cv2.putText(frame, label, (x1, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, BOX_COLOR, 1, cv2.LINE_AA)
+        # Step 7: Draw road statistics (vehicle count, density, avg speed)
+        frame = road_analyzer.draw_road_statistics(
+            frame,
+            road_stats,
+            road_a_color=(100, 200, 255),  # Orange-ish (BGR)
+            road_b_color=(255, 165, 0),    # Blue-ish (BGR)
+            font_scale=0.65,
+            thickness=2,
+        )
 
-        # ── 7. Overlay stats panel (top-left) ─────────────────────────────────
-        congestion_color = (0, 255, 0)     # green  – LIGHT
-        if congestion == "MEDIUM":
-            congestion_color = (0, 165, 255)   # orange
-        elif congestion == "HEAVY":
-            congestion_color = (0, 0, 255)     # red
+        # Step 8: Draw detected vehicles with IDs, speeds, and confidence
+        if USE_HYBRID_DETECTION and hybrid_detections:
+            # Use hybrid drawing with GREEN for motion-validated, ORANGE for static
+            frame = HybridAnalyzer.draw_detections(frame, hybrid_detections, draw_motion_status=True)
+        else:
+            # Draw with road-based colors (original logic)
+            frame = road_analyzer.draw_detected_vehicles(
+                frame,
+                road_stats,
+                speeds,
+                confidence_map,  # Pass confidence scores
+                road_a_box_color=(100, 200, 255),  # Orange for Road A
+                road_b_box_color=(255, 165, 0),    # Blue for Road B
+                box_thickness=2,
+                font_scale=0.45,
+            )
 
-        overlay_lines = [
-            (f"Vehicles: {len(tracked_vehicles)}",      (0, 255, 0)),
-            (f"L1: {lane_counts['L1']}",                (255, 200, 0)),
-            (f"L2: {lane_counts['L2']}",                (255, 200, 0)),
-            (f"L3: {lane_counts['L3']}",                (255, 200, 0)),
-            (f"L4: {lane_counts['L4']}",                (255, 200, 0)),
-            (f"L5: {lane_counts['L5']}",                (255, 200, 0)),
-            (f"Traffic: {congestion}",                  congestion_color),
-            (f"Avg Speed: {avg_speed:.1f} px/fr",       (0, 220, 255)),
-        ]
-        for i, (text, color) in enumerate(overlay_lines):
-            cv2.putText(frame, text, (20, 30 + i * 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        # Step 8B: Draw MOG2 motion detection boxes (RED) as separate layer
+        if USE_MOG2_DETECTION and mog2:
+            mog2_boxes = mog2.get_bounding_boxes(frame, min_area=400, max_area=None)
+            frame = HybridAnalyzer.draw_mog2_detections(frame, mog2_boxes)
 
-        # Current filename at the bottom of the frame so it's always visible.
-        cv2.putText(frame, os.path.basename(video_path),
-                    (20, frame.shape[0] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        # Step 9: Show current filename at bottom
+        cv2.putText(
+            frame,
+            os.path.basename(video_path),
+            (20, frame.shape[0] - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
 
-        # ── 8. Show windows ───────────────────────────────────────────────────
+        # Step 9B: Optional motion overlay
+        if USE_MOTION_OVERLAY and mog2:
+            motion_mask = mog2.get_foreground_mask(frame)
+            frame = HybridAnalyzer.draw_motion_overlay(frame, motion_mask, alpha=0.2)
+
+        # Step 10: Show windows
         cv2.imshow("Traffic Detection", frame)
-        fg_display = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
-        cv2.imshow("Foreground Mask", fg_display)
 
-        # ESC skips to the next video; any other key continues.
-        key = cv2.waitKey(1) & 0xFF
+        # ESC skips to next video
+        key = cv2.waitKey(frame_delay) & 0xFF
         if key == 27:
-            print("[INFO] ESC pressed — skipping to next video.")
+            print("[INFO] ESC pressed - skipping to next video.")
             cap.release()
-            return False   # signal: user pressed ESC
+            return False
 
     cap.release()
-    return True   # signal: video finished normally
+    return True
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main entry point
 
 def main():
-    # Collect all supported video files in the videos directory.
-    videos_dir  = os.path.normpath(VIDEOS_DIR)
-    video_files = (
-        glob.glob(os.path.join(videos_dir, "*.avi")) +
-        glob.glob(os.path.join(videos_dir, "*.mp4")) +
-        glob.glob(os.path.join(videos_dir, "*.mov")) +
-        glob.glob(os.path.join(videos_dir, "*.MOV"))
-    )
-    video_files.sort()   # process in alphabetical order
+    if len(sys.argv) > 1:
+        source = sys.argv[1]
+        if os.path.isdir(source):
+            videos_dir = os.path.normpath(source)
+            video_files = (
+                glob.glob(os.path.join(videos_dir, "*.avi")) +
+                glob.glob(os.path.join(videos_dir, "*.mp4")) +
+                glob.glob(os.path.join(videos_dir, "*.mov")) +
+                glob.glob(os.path.join(videos_dir, "*.MOV"))
+            )
+        else:
+            video_files = [source]
+        video_files.sort()
+    else:
+        # Collect all supported video files in the videos directory.
+        videos_dir = os.path.normpath(VIDEOS_DIR)
+        video_files = (
+            glob.glob(os.path.join(videos_dir, "*.avi")) +
+            glob.glob(os.path.join(videos_dir, "*.mp4")) +
+            glob.glob(os.path.join(videos_dir, "*.mov")) +
+            glob.glob(os.path.join(videos_dir, "*.MOV"))
+        )
+        if not video_files and os.path.exists(DATASET_SAMPLE_VIDEO):
+            video_files = [DATASET_SAMPLE_VIDEO]
+        video_files.sort()   # process in alphabetical order
 
     if not video_files:
-        print(f"[ERROR] No video files found in: {videos_dir}")
-        print("Supported formats: .avi  .mp4  .mov")
+        print(f"[ERROR] No video files found in: {VIDEOS_DIR}")
+        print("Pass a video path as an argument, or place videos in data/videos.")
         sys.exit(1)
 
-    print(f"[INFO] Found {len(video_files)} video(s) in {videos_dir}")
+    print(f"[INFO] Found {len(video_files)} video(s)")
 
     # The lane analyser is built once and reused across all videos because
     # the lane geometry stays the same for a fixed camera.
-    analyzer = LaneAnalyzer(roi_x_min=ROI_X_MIN, roi_x_max=ROI_X_MAX)
-
     for idx, video_path in enumerate(video_files, start=1):
         print(f"[INFO] Video {idx}/{len(video_files)}: {os.path.basename(video_path)}")
-        process_video(video_path, analyzer)
+        process_video(video_path, loop=True)
 
     cv2.destroyAllWindows()
     print("[INFO] All videos processed. Exiting.")
