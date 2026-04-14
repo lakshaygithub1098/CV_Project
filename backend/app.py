@@ -183,7 +183,7 @@ def process_video(video_path, loop=True):
         speeds = estimator.estimate_speed(tracked_vehicles)
 
         # Step 5: Assign vehicles to roads and compute statistics
-        road_stats = road_analyzer.compute_road_statistics(tracked_vehicles, speeds)
+        road_stats = road_analyzer.compute_road_stats(tracked_vehicles, speeds)
 
         # Step 6: Draw road divider line and labels
         frame = road_analyzer.draw_road_divider(frame, color=(0, 255, 255), thickness=2)
@@ -193,8 +193,6 @@ def process_video(video_path, loop=True):
         frame = road_analyzer.draw_road_statistics(
             frame,
             road_stats,
-            road_a_color=(100, 200, 255),  # Orange-ish (BGR)
-            road_b_color=(255, 165, 0),    # Blue-ish (BGR)
             font_scale=0.65,
             thickness=2,
         )
@@ -210,8 +208,6 @@ def process_video(video_path, loop=True):
                 road_stats,
                 speeds,
                 confidence_map,  # Pass confidence scores
-                road_a_box_color=(100, 200, 255),  # Orange for Road A
-                road_b_box_color=(255, 165, 0),    # Blue for Road B
                 box_thickness=2,
                 font_scale=0.45,
             )
